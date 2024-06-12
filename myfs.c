@@ -1,186 +1,313 @@
-#include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
-#include <linux/mount.h>
+#include <linux/highmem.h>
+#include <linux/time.h>
 #include <linux/init.h>
-#include <linux/namei.h>
-#define AUFS_MAGIC 0x64668735
-static struct vfsmount *myfs_mount;
-static int myfs_mount_count;
-static struct inode *myfs_get_inode(struct super_block *sb, int mode, dev_t dev)
-{
-     struct inode *inode = new_inode(sb);
-     if (inode)
-     {
-          inode->i_mode = mode;
-          inode->i_uid = current->fsuid;
-          inode->i_gid = current->fsgid;
-          // inode->i_blksize = 4096;
-          inode->i_blocks = 0;
-          inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-          switch (mode & S_IFMT)
-          {
-          default:
-               init_special_inode(inode, mode, dev);
-               break;
-          case S_IFREG:
-               printk("creat a  file \n");
-               break;
-          case S_IFDIR:
-               inode->i_op = &simple_dir_inode_operations;
-               inode->i_fop = &simple_dir_operations;
-               printk("creat a dir file \n");
-               inode->i_nlink++;
-               break;
-          }
-     }
-     return inode;
-}
-/* SMP-safe */
-static int myfs_mknod(struct inode *dir, struct dentry *dentry,
-                      int mode, dev_t dev)
-{
-     struct inode *inode;
-     int error = -EPERM;
-     if (dentry->d_inode)
-          return -EEXIST;
-     inode = myfs_get_inode(dir->i_sb, mode, dev);
-     if (inode)
-     {
-          d_instantiate(dentry, inode);
-          dget(dentry);
-          error = 0;
-     }
-     return error;
-}
-static int myfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
-{
-     int res;
-     res = myfs_mknod(dir, dentry, mode | S_IFDIR, 0);
-     if (!res)
-          dir->i_nlink++;
-     return res;
-}
-static int myfs_create(struct inode *dir, struct dentry *dentry, int mode)
-{
-     return myfs_mknod(dir, dentry, mode | S_IFREG, 0);
-}
-static int myfs_fill_super(struct super_block *sb, void *data, int silent)
-{
-     static struct tree_descr debug_files[] = {{""}};
-     return simple_fill_super(sb, AUFS_MAGIC, debug_files);
-}
-int myfs_get_sb(struct file_system_type *fs_type,
-                int flags, const char *dev_name,
-                void *data, struct vfsmount *mnt)
-{
-     return get_sb_single(fs_type, flags, data, myfs_fill_super, mnt);
-}
-static struct file_system_type au_fs_type = {
-    .owner = THIS_MODULE,
-    .name = "myfs",
-    .get_sb = myfs_get_sb,
-    .kill_sb = kill_litter_super,
-};
-static int myfs_create_by_name(const char *name, mode_t mode,
-                               struct dentry *parent,
-                               struct dentry **dentry)
-{
-     int error = 0;
-     /* If the parent is not specified, we create it in the root.
-      * We need the root dentry to do this, which is in the super
-      * block. A pointer to that is in the struct vfsmount that we
-      * have around.
-      */
-     if (!parent)
-     {
-          if (myfs_mount && myfs_mount->mnt_sb)
-          {
-               parent = myfs_mount->mnt_sb->s_root;
-          }
-     }
-     if (!parent)
-     {
-          printk("Ah! can not find a parent!\n");
-          return -EFAULT;
-     }
-     *dentry = NULL;
-     mutex_lock(&parent->d_inode->i_mutex);
-     *dentry = lookup_one_len(name, parent, strlen(name));
-     if (!IS_ERR(dentry))
-     {
-          if ((mode & S_IFMT) == S_IFDIR)
-               error = myfs_mkdir(parent->d_inode, *dentry, mode);
-          else
-               error = myfs_create(parent->d_inode, *dentry, mode);
-     }
-     else
-          error = PTR_ERR(dentry);
-     mutex_unlock(&parent->d_inode->i_mutex);
-     return error;
-}
-struct dentry *myfs_create_file(const char *name, mode_t mode,
-                                struct dentry *parent, void *data,
-                                struct file_operations *fops)
-{
-     struct dentry *dentry = NULL;
-     int error;
-     printk("myfs: creating file '%s'\n", name);
-     error = myfs_create_by_name(name, mode, parent, &dentry);
-     if (error)
-     {
-          dentry = NULL;
-          goto exit;
-     }
-     if (dentry->d_inode)
-     {
-          // if (data)
-          // dentry->d_inode->u.generic_ip = data;
-          if (fops)
-               dentry->d_inode->i_fop = fops;
-     }
-exit:
-     return dentry;
-}
-struct dentry *myfs_create_dir(const char *name, struct dentry *parent)
-{
-     return myfs_create_file(name,
-                             S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
-                             parent, NULL, NULL);
-}
-static int __init myfs_init(void)
-{
-     int retval;
-     struct dentry *pslot;
+#include <linux/string.h>
+#include <linux/backing-dev.h>
+#include <linux/sched.h>
+#include <linux/parser.h>
+#include <linux/magic.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 
-     retval = register_filesystem(&au_fs_type);
-     if (!retval)
-     {
-          myfs_mount = kern_mount(&au_fs_type);
-          if (IS_ERR(myfs_mount))
-          {
-               printk(KERN_ERR "myfs: could not mount!\n");
-               unregister_filesystem(&au_fs_type);
-               return retval;
-          }
-     }
-     pslot = myfs_create_dir("woman star", NULL);
-     myfs_create_file("lbb", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     myfs_create_file("fbb", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     myfs_create_file("ljl", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     pslot = myfs_create_dir("man star", NULL);
-     myfs_create_file("ldh", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     myfs_create_file("lcw", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     myfs_create_file("jw", S_IFREG | S_IRUGO, pslot, NULL, NULL);
-     return retval;
-}
-static void __exit myfs_exit(void)
+extern const struct inode_operations myfs_file_inode_operations;
+
+static unsigned long myfs_mmu_get_unmapped_area(struct file *file,
+		unsigned long addr, unsigned long len, unsigned long pgoff,
+		unsigned long flags)
 {
-     simple_release_fs(&myfs_mount, &myfs_mount_count);
-     unregister_filesystem(&au_fs_type);
+	return current->mm->get_unmapped_area(file, addr, len, pgoff, flags);
 }
-module_init(myfs_init);
-module_exit(myfs_exit);
+
+const struct file_operations myfs_file_operations = {
+	.read_iter	= generic_file_read_iter,
+	.write_iter	= generic_file_write_iter,
+	.mmap		= generic_file_mmap,
+	.fsync		= noop_fsync,
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= iter_file_splice_write,
+	.llseek		= generic_file_llseek,
+	.get_unmapped_area	= myfs_mmu_get_unmapped_area,
+};
+
+const struct inode_operations myfs_file_inode_operations = {
+	.setattr	= simple_setattr,
+	.getattr	= simple_getattr,
+};
+
+struct myfs_mount_opts {
+	umode_t mode;
+};
+
+struct myfs_fs_info {
+	struct myfs_mount_opts mount_opts;
+};
+
+#define RAMFS_DEFAULT_MODE	0755
+
+static const struct super_operations myfs_ops;
+static const struct inode_operations myfs_dir_inode_operations;
+
+struct inode *myfs_get_inode(struct super_block *sb,
+				const struct inode *dir, umode_t mode, dev_t dev)
+{
+	struct inode * inode = new_inode(sb);
+
+	if (inode) {
+		inode->i_ino = get_next_ino();
+		inode_init_owner(&init_user_ns, inode, dir, mode);
+		inode->i_mapping->a_ops = &ram_aops;
+		mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+		mapping_set_unevictable(inode->i_mapping);
+		inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
+		switch (mode & S_IFMT) {
+		default:
+			init_special_inode(inode, mode, dev);
+			break;
+		case S_IFREG:
+			inode->i_op = &myfs_file_inode_operations;
+			inode->i_fop = &myfs_file_operations;
+			break;
+		case S_IFDIR:
+			inode->i_op = &myfs_dir_inode_operations;
+			inode->i_fop = &simple_dir_operations;
+
+			/* directory inodes start off with i_nlink == 2 (for "." entry) */
+			inc_nlink(inode);
+			break;
+		case S_IFLNK:
+			inode->i_op = &page_symlink_inode_operations;
+			inode_nohighmem(inode);
+			break;
+		}
+	}
+	return inode;
+}
+
+/*
+ * File creation. Allocate an inode, and we're done..
+ */
+/* SMP-safe */
+static int
+myfs_mknod(struct user_namespace *mnt_userns, struct inode *dir,
+	    struct dentry *dentry, umode_t mode, dev_t dev)
+{
+	struct inode * inode = myfs_get_inode(dir->i_sb, dir, mode, dev);
+	int error = -ENOSPC;
+
+	if (inode) {
+		d_instantiate(dentry, inode);
+		dget(dentry);	/* Extra count - pin the dentry in core */
+		error = 0;
+		dir->i_mtime = dir->i_ctime = current_time(dir);
+	}
+	return error;
+}
+
+static int myfs_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
+		       struct dentry *dentry, umode_t mode)
+{
+	int retval = myfs_mknod(&init_user_ns, dir, dentry, mode | S_IFDIR, 0);
+	if (!retval)
+		inc_nlink(dir);
+
+	printk(KERN_INFO "myfs: create dir %s success!\n", dentry->d_iname);
+	return retval;
+}
+
+static int myfs_create(struct user_namespace *mnt_userns, struct inode *dir,
+			struct dentry *dentry, umode_t mode, bool excl)
+{
+	int ret = 0;
+	ret =  myfs_mknod(&init_user_ns, dir, dentry, mode | S_IFREG, 0);
+	printk(KERN_INFO "myfs: create file %s success!\n", dentry->d_iname);
+	return ret;
+}
+
+static int myfs_symlink(struct user_namespace *mnt_userns, struct inode *dir,
+			 struct dentry *dentry, const char *symname)
+{
+	struct inode *inode;
+	int error = -ENOSPC;
+
+	inode = myfs_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0);
+	if (inode) {
+		int l = strlen(symname)+1;
+		error = page_symlink(inode, symname, l);
+		if (!error) {
+			d_instantiate(dentry, inode);
+			dget(dentry);
+			dir->i_mtime = dir->i_ctime = current_time(dir);
+		} else
+			iput(inode);
+	}
+	return error;
+}
+
+static int myfs_tmpfile(struct user_namespace *mnt_userns,
+			 struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode;
+
+	inode = myfs_get_inode(dir->i_sb, dir, mode, 0);
+	if (!inode)
+		return -ENOSPC;
+	d_tmpfile(dentry, inode);
+	return 0;
+}
+
+static const struct inode_operations myfs_dir_inode_operations = {
+	.create		= myfs_create,
+	.lookup		= simple_lookup,
+	.link		= simple_link,
+	.unlink		= simple_unlink,
+	.symlink	= myfs_symlink,
+	.mkdir		= myfs_mkdir,
+	.rmdir		= simple_rmdir,
+	.mknod		= myfs_mknod,
+	.rename		= simple_rename,
+	.tmpfile	= myfs_tmpfile,
+};
+
+/*
+ * Display the mount options in /proc/mounts.
+ */
+static int myfs_show_options(struct seq_file *m, struct dentry *root)
+{
+	struct myfs_fs_info *fsi = root->d_sb->s_fs_info;
+
+	if (fsi->mount_opts.mode != RAMFS_DEFAULT_MODE)
+		seq_printf(m, ",mode=%o", fsi->mount_opts.mode);
+	return 0;
+}
+
+static const struct super_operations myfs_ops = {
+	.statfs		= simple_statfs,
+	.drop_inode	= generic_delete_inode,
+	.show_options	= myfs_show_options,
+};
+
+enum myfs_param {
+	Opt_mode,
+};
+
+const struct fs_parameter_spec myfs_fs_parameters[] = {
+	fsparam_u32oct("mode",	Opt_mode),
+	{}
+};
+
+static int myfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct fs_parse_result result;
+	struct myfs_fs_info *fsi = fc->s_fs_info;
+	int opt;
+
+	opt = fs_parse(fc, myfs_fs_parameters, param, &result);
+	if (opt < 0) {
+		/*
+		 * We might like to report bad mount options here;
+		 * but traditionally myfs has ignored all mount options,
+		 * and as it is used as a !CONFIG_SHMEM simple substitute
+		 * for tmpfs, better continue to ignore other mount options.
+		 */
+		if (opt == -ENOPARAM)
+			opt = 0;
+		return opt;
+	}
+
+	switch (opt) {
+	case Opt_mode:
+		fsi->mount_opts.mode = result.uint_32 & S_IALLUGO;
+		break;
+	}
+
+	return 0;
+}
+
+static int myfs_fill_super(struct super_block *sb, struct fs_context *fc)
+{
+	struct myfs_fs_info *fsi = sb->s_fs_info;
+	struct inode *inode;
+
+	sb->s_maxbytes		= MAX_LFS_FILESIZE;
+	sb->s_blocksize		= PAGE_SIZE;
+	sb->s_blocksize_bits	= PAGE_SHIFT;
+	sb->s_magic		= RAMFS_MAGIC;
+	sb->s_op		= &myfs_ops;
+	sb->s_time_gran		= 1;
+
+	inode = myfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int myfs_get_tree(struct fs_context *fc)
+{
+	return get_tree_nodev(fc, myfs_fill_super);
+}
+
+static void myfs_free_fc(struct fs_context *fc)
+{
+	kfree(fc->s_fs_info);
+}
+
+static const struct fs_context_operations myfs_context_ops = {
+	.free		= myfs_free_fc,
+	.parse_param	= myfs_parse_param,
+	.get_tree	= myfs_get_tree,
+};
+
+int myfs_init_fs_context(struct fs_context *fc)
+{
+	struct myfs_fs_info *fsi;
+
+	fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
+	if (!fsi)
+		return -ENOMEM;
+
+	fsi->mount_opts.mode = RAMFS_DEFAULT_MODE;
+	fc->s_fs_info = fsi;
+	fc->ops = &myfs_context_ops;
+	return 0;
+}
+
+static void myfs_kill_sb(struct super_block *sb)
+{
+	kfree(sb->s_fs_info);
+	kill_litter_super(sb);
+}
+
+static struct file_system_type myfs_fs_type = {
+     .owner = THIS_MODULE,
+	.name		= "myfs",
+	.init_fs_context = myfs_init_fs_context,
+	.parameters	= myfs_fs_parameters,
+	.kill_sb	= myfs_kill_sb,
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+
+static int __init init_myfs_fs(void)
+{
+	int ret;
+	ret = register_filesystem(&myfs_fs_type);
+	printk(KERN_INFO "myfs: install myfs success!\n");
+	return ret;
+}
+
+static void __exit exit_myfs_fs(void)
+{
+     unregister_filesystem(&myfs_fs_type);
+	 printk(KERN_INFO "myfs: uninstall myfs success!\n");
+}
+
+module_init(init_myfs_fs);
+module_exit(exit_myfs_fs);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("This is a simple module");
 MODULE_VERSION("Ver 0.1");
